@@ -10,13 +10,12 @@ class Message:
         embed = discord.Embed(color=discord.Color.from_rgb(3, 191, 153))
         embed.set_author(name=author_name, icon_url=avatar_url)
         embed.description = content
-        embed.set_footer(text='This was a reply.' if not has_embeds else 'This reply had embeds')
+        embed.set_footer(text='This reply had embeds' if has_embeds else '')
         return embed
     
     @staticmethod
-    def emoji_display(author_name, avatar_url, emojis):
+    def emoji_display(emojis):
         embed = discord.Embed(color=discord.Color.from_rgb(3, 191, 153))
-        # embed.set_author(name=author_name, icon_url=avatar_url)
         embed.description = '|'
         for emoji, count in emojis:
             embed.description += f' {discord.PartialEmoji.from_str(emoji)}: `{count}` |'

@@ -88,7 +88,6 @@ async def write_csv(messages, file_name: str) -> discord.File:
             components = []
             for component in message.components:
                 components.append(component_to_dict(component))
-            print(components)
             
             if message.reference:
                 for message2 in messages:
@@ -161,10 +160,7 @@ def view_with_components(components):
     :return: View with components.
     """
     view = EmptyView()
-    print(components)
     for component in components:
-        print(component)
-        print(type(component))
         view.add_item(component)
     return view
 
