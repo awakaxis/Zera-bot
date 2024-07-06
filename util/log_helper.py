@@ -3,7 +3,7 @@ import logging
 
 class ProjectLogFilter(logging.Filter):
     def filter(self, record):
-        return record.name.startswith('mugbot')
+        return record.name.startswith('zerabot')
 
 
 class ColorFormatter(logging.Formatter):
@@ -34,7 +34,7 @@ class ColorFormatter(logging.Formatter):
 
 
 def get_logger(name):
-    logger = logging.getLogger(f'mugbot.{name}')
+    logger = logging.getLogger(f'zerabot.{name}')
     logger.setLevel(logging.DEBUG)
     handler = logging.StreamHandler()
     handler.setLevel(logging.DEBUG)

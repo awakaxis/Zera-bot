@@ -1,13 +1,19 @@
+import ast
 import importlib
 import io
+import os
+import re
 import aiohttp
 from discord import app_commands as ap
 from util import log_helper
+from data import embeds as em
 import discord
 import datetime
 import csv
 
 logger = log_helper.get_logger(__name__)
+
+should_stop = False
 
 async def load_command_groups(bot, module_name: str):
     """
@@ -61,13 +67,20 @@ async def get_message_count(channel: discord.TextChannel):
 
 async def write_csv(messages, file_name: str) -> discord.File:
     """
-    Writes messages to a csv file.
+    Writes messages to a csv file.\n
+    messages are stored in the following format:\n
+    [author's name, author's avatar url, message content, message embeds, message id, message reference id (reply id), interaction name, interaction user's name, message reactions, message attachments, message stickers, message components, boolean whether the message is pinned (0 or 1)]
     :param message: Messages to write to the file.
-    :return: Void
+    :return: discord.File
     """
+    # reversed because discord returns channel history from newest to oldest
+    messages = messages[::-1]
     with open(file_name, 'w', newline='', encoding="utf-8") as file:
         writer = csv.writer(file)
         for message in messages:
+
+            if message.type == discord.MessageType.thread_created:
+                writer.writerow([message.author.name, message.author.display_avatar.url, "placeholder thread text", [], message.id, 0, 0, 0, [], [], [], [], 0, 1 + message.flags.value])
             
             embeds = []
             for embed in message.embeds:
@@ -88,15 +101,14 @@ async def write_csv(messages, file_name: str) -> discord.File:
             components = []
             for component in message.components:
                 components.append(component_to_dict(component))
-            
             if message.reference:
                 for message2 in messages:
                     if message2.id == message.reference.message_id:
-                        writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, message.reference.message_id, 0, 0, emojis, attachments, stickers, components])
+                        writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, message.reference.message_id, 0, 0, emojis, attachments, stickers, components, 1 if message.pinned else 0])
             elif message.type == discord.MessageType.chat_input_command:
-                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, message.interaction.name, message.interaction.user.name, emojis, attachments, stickers, components])
+                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, message.interaction.name, message.interaction.user.name, emojis, attachments, stickers, components, 1 if message.pinned else 0])
             else:
-                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, 0, 0, emojis, attachments, stickers, components])
+                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, 0, 0, emojis, attachments, stickers, components, 1 if message.pinned else 0])
         return discord.File(file_name, filename='export.csv')
     
 
@@ -170,3 +182,188 @@ class EmptyView(discord.ui.View):
     """
     def __init__(self):
         super().__init__()
+
+async def fetch_messages(interaction):
+    actually_fetched = 0
+    messages = []
+    # fetch the most recent n messages and add them to the list
+    async for message in interaction.channel.history(limit=None):
+        try:
+            if message.type == discord.MessageType.default or message.type == discord.MessageType.reply:
+                messages.append(message)
+                actually_fetched += 1
+            elif message.type == discord.MessageType.chat_input_command or message.type == discord.MessageType.context_menu_command:
+                messages.append(message)
+                actually_fetched += 1
+            elif message.type == discord.MessageType.thread_created:
+                print(f'thread created: {message}')
+                messages.append(message)
+                actually_fetched += 1
+            else:
+                logger.info(f'Found a message of type {message.type}.')
+
+        except Exception as e:
+            logger.error(f'error: {e}')
+            pass
+    total_messages = await get_message_count(interaction.channel)
+    return messages, total_messages[0], actually_fetched
+
+async def handle_messages(reader, interaction, channel_name, bot, rows, last_import):
+    global should_stop
+    sent = []
+    rows = []
+    for row in reader:
+        rows.append(row)
+    if type(interaction.channel) == discord.Thread:
+        webhook = await interaction.channel.parent.create_webhook(name='zerahook', avatar=None)
+    else:
+        webhook = await interaction.channel.create_webhook(name=f'zerahook', avatar=None)
+    timeprev = None
+    timepost = None
+    for rownum, row in enumerate(rows):
+        if should_stop:
+            if row[5] != 0:
+                await webhook.delete()
+                rows2 = rows[rownum:]
+                with open(f'{channel_name}_in_progress.csv', 'w', newline='', encoding='utf-8') as file2:
+                    writer = csv.writer(file2)
+                    for row2 in rows2:
+                        writer.writerow(row2)
+                rows = []
+                should_stop = False
+                await interaction.user.send('Import cancelled.')
+                return
+        print("rownum = " + str(rownum))
+        if rownum == 0:
+            timeprev = datetime.datetime.now()
+        try:
+            author_name, author_avatar_url, content, embeds, original_id, reference_id, inter_name, inter_user, reactions, attachments, stickers, components, pin_flag = row
+
+            embeds2 = []
+            embeds = eval(embeds)
+            for i in range(len(embeds)):
+                embed = dict(embeds[i])
+                embeds2.append(discord.Embed.from_dict(embed))
+            
+            files = []
+            large_files = []
+            if attachments != '[]':
+                for attachment in eval(attachments):
+                    filedata = await read_attachment_url(attachment)
+                    if filedata[1] > 8_000_000 and bot.get_guild(interaction.guild_id).premium_tier < 2:
+                        logger.debug('An attachment was too large!')
+                        large_files.append(attachment)
+                        continue
+                    elif filedata[1] > 50_000_000:
+                        logger.debug('An attachment was too large!')
+                        large_files.append(attachment)
+                        continue
+                    else:
+                        files.append(discord.File(filedata[0], filename=re.match(r'.*/(.*\.\w+)', attachment)[0]))
+            if stickers != '[]':
+                    for sticker in eval(stickers):
+                        filedata = await read_attachment_url(sticker)
+                        files.append(discord.File(filedata[0], filename=re.match(r'.*/(.*\.\w+)', sticker)[0]))
+            # split files into a list of lists of 10 files
+            files = [files[i:i + 10] for i in range(0, len(files), 10)] if files else [[]]
+
+            # handle components
+            view = None
+            if components != '[]':
+                components = ast.literal_eval(components)
+                complist = []
+                rowcount = 0
+                for comp in components:
+                    if comp['type'] == 1:
+                        rowcount += 1
+                        for comp2 in comp['children']:
+                            complist.append(dict_to_component(comp2, rowcount - 1))
+                    else:
+                        complist.append(dict_to_component(comp, rowcount -1))
+                view = view_with_components(complist)
+            # handle reply messages
+            elif int(reference_id) != 0:
+                for message, original_id in sent:
+                    if original_id == reference_id:
+                        embeds2.insert(0, em.Message.reply_message(author_name, author_avatar_url, content, len(embeds) > 1))
+                        message2 = await message.reply(embeds=embeds2, files=files[0] if files else None, view=view if view else EmptyView())
+                        for i, filelist in enumerate(files):
+                            if i == 0:
+                                pass
+                            else:
+                                await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url)
+                        if (large_files):
+                            message_text = ''
+                            for large_file in large_files:
+                                message_text += large_file + '\n'
+                            await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url)
+                        break
+            # handle interaction messages
+            elif inter_name != '0':
+                try:
+                    message2 = await webhook.send(content=content, embeds=embeds2, username=f'{inter_user} used {inter_name}', avatar_url=author_avatar_url, files=files[0] if files else None, view=view if view else EmptyView(), wait=True)
+                except Exception as e:
+                    message2 = None
+                for i, filelist in enumerate(files):
+                    if i == 0:
+                        pass
+                    else:
+                        if not message2:
+                            message2 = await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, wait=True)
+                        else:
+                            await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url)
+                if (large_files):
+                    message_text = ''
+                    for large_file in large_files:
+                        message_text += large_file + '\n'
+                    if not message2:
+                        message = await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, wait=True)
+                    else:
+                        await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url)
+            # handle normal messages
+            else:
+                try:
+                    message2 = await webhook.send(content=content, embeds=embeds2, username=author_name, avatar_url=author_avatar_url, files=files[0] if files else None, view=view if view else EmptyView(), wait=True)
+                except Exception as e:
+                    message2 = None
+                for i, filelist in enumerate(files):
+                    if i == 0:
+                        pass
+                    else:
+                        if not message2:
+                            message2 = await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, wait=True)
+                        else:
+                            await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url)
+                if (large_files):
+                    message_text = ''
+                    for large_file in large_files:
+                        message_text += large_file + '\n'
+                    if not message2:
+                        message2 = await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, wait=True)
+                    else:
+                        await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url)
+            # send secondary messages with the reactions
+            sent.append((message2, original_id))
+            if int(pin_flag) == 1:
+                await message2.pin()
+            if reactions != '[]':
+                await message2.reply(embed=em.Message.emoji_display(eval(reactions)))
+            last_import = rownum
+        except Exception as e:
+            print(e)
+            print(row)
+            print(rownum)
+            with open(f'badexit.csv', 'w', newline='', encoding='utf-8') as file2:
+                writer = csv.writer(file2)
+                rows2 = rows[rownum:]
+                for row in rows2:
+                    writer.writerow(row)
+            return
+        if rownum == len(rows) - 1:
+                timepost = datetime.datetime.now()
+    if os.path.exists(f'{channel_name}_in_progress.csv'):
+        os.remove(f'{channel_name}_in_progress.csv')
+    await webhook.delete()
+    await interaction.user.send(f'Imported {len(rows)} messages in {timepost - timeprev} seconds.')
+    rows = []
+
