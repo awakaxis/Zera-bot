@@ -7,6 +7,7 @@ import aiohttp
 from discord import app_commands as ap
 from util import log_helper
 from data import embeds as em
+from data.exceptions import *
 import discord
 import datetime
 import csv
@@ -55,17 +56,22 @@ async def get_message_count(channel: discord.TextChannel):
     :param channel: Channel to count messages in.
     :return: Tuple of count and time taken.
     """
-    start_time = datetime.datetime.utcnow()
+    start_time = datetime.datetime.now()
     message_count = 0
     async for _ in channel.history(limit=None):
         message_count += 1
-    end_time = datetime.datetime.utcnow()
+    end_time = datetime.datetime.now()
     time_taken = end_time - start_time
     logger.debug(f"Counted {message_count} messages in {time_taken.total_seconds()} seconds.")
     return message_count, time_taken.total_seconds()
 
+async def write_forum_csvs(messages, file_name: str) -> discord.File:
+    """
+    Writes forum thread atlas to a csv, and indexed forum messages to another csv.
+    :param messages: list<dict<list, int>>: list of dicts of lists of messages and the thread id for those messages.
+    """
 
-async def write_csv(messages, file_name: str) -> discord.File:
+async def write_messages_csv(messages, file_name: str) -> discord.File:
     """
     Writes messages to a csv file.\n
     messages are stored in the following format:\n
@@ -80,7 +86,17 @@ async def write_csv(messages, file_name: str) -> discord.File:
         for message in messages:
 
             if message.type == discord.MessageType.thread_created:
-                writer.writerow([message.author.name, message.author.display_avatar.url, "placeholder thread text", [], message.id, 0, 0, 0, [], [], [], [], 0, 1 + message.flags.value])
+                # if the message isnt a thread sysmessage, this code wont run and the flag is 0
+                # if the message has no thread, the flag is 1
+                # if the message has a thread but it couldnt be associated, the flag is 2
+                # if the message has a thread and it could be associated, the flag is the thread id
+                thread = associate_thread(message)
+                thread_flag = 1
+                if thread:
+                    thread_flag = thread.id
+                else:
+                    thread_flag = 2 if message.flags.value == 32 else 1
+                writer.writerow([message.author.name, message.author.display_avatar.url, "thread placeholder text" if not thread else thread.name, [], message.id, 0, 0, 0, [], [], [], [], 0, thread_flag])
             
             embeds = []
             for embed in message.embeds:
@@ -104,11 +120,11 @@ async def write_csv(messages, file_name: str) -> discord.File:
             if message.reference:
                 for message2 in messages:
                     if message2.id == message.reference.message_id:
-                        writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, message.reference.message_id, 0, 0, emojis, attachments, stickers, components, 1 if message.pinned else 0])
+                        writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, message.reference.message_id, 0, 0, emojis, attachments, stickers, components, 1 if message.pinned else 0, 0])
             elif message.type == discord.MessageType.chat_input_command:
-                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, message.interaction.name, message.interaction.user.name, emojis, attachments, stickers, components, 1 if message.pinned else 0])
+                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, message.interaction.name, message.interaction.user.name, emojis, attachments, stickers, components, 1 if message.pinned else 0, 0])
             else:
-                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, 0, 0, emojis, attachments, stickers, components, 1 if message.pinned else 0])
+                writer.writerow([message.author.name, message.author.display_avatar.url, message.content, embeds, message.id, 0, 0, 0, emojis, attachments, stickers, components, 1 if message.pinned else 0, 0])
         return discord.File(file_name, filename='export.csv')
     
 
@@ -183,11 +199,44 @@ class EmptyView(discord.ui.View):
     def __init__(self):
         super().__init__()
 
-async def fetch_messages(interaction):
+async def forum_tag_to_dict(forum_tag: discord.ForumTag, guild):
+    emoji = None
+    if forum_tag.emoji:
+        emoji = str(forum_tag.emoji) if forum_tag.emoji.id == None else await guild.fetch_emoji(forum_tag.emoji.id)
+    return {'emoji': emoji if type(emoji) == str or not emoji else f'<:{emoji.name}:{emoji.id}>',
+            'moderated': forum_tag.moderated,
+            'name': forum_tag.name,}
+
+def dict_to_forum_tag(dictionary: dict):
+    return discord.ForumTag(emoji=dictionary['emoji'], moderated=dictionary['moderated'], name=dictionary['name'])
+
+def associate_thread(message) -> discord.Thread:
+    """
+    Associates a thread with a message based on the starter message's creation date.
+    :param message: Message to associate a thread with.
+    :return: Associated thread.
+    """
+    if message.type != discord.MessageType.thread_created:
+        raise TypeError('Message is not a thread creation sysmessage.')
+    
+    possible_matches = []
+
+    for thread in message.channel.threads:
+        if thread.created_at == message.created_at:
+            possible_matches.append(thread)
+    if (len(possible_matches) == 1):
+        return possible_matches[0]
+    elif (len(possible_matches) == 0):
+        return None
+    else:
+        logger.error(DuplicateThreadException(len(possible_matches), message))
+    return None
+
+async def fetch_messages(channel):
     actually_fetched = 0
     messages = []
     # fetch the most recent n messages and add them to the list
-    async for message in interaction.channel.history(limit=None):
+    async for message in channel.history(limit=None):
         try:
             if message.type == discord.MessageType.default or message.type == discord.MessageType.reply:
                 messages.append(message)
@@ -196,7 +245,6 @@ async def fetch_messages(interaction):
                 messages.append(message)
                 actually_fetched += 1
             elif message.type == discord.MessageType.thread_created:
-                print(f'thread created: {message}')
                 messages.append(message)
                 actually_fetched += 1
             else:
@@ -205,19 +253,21 @@ async def fetch_messages(interaction):
         except Exception as e:
             logger.error(f'error: {e}')
             pass
-    total_messages = await get_message_count(interaction.channel)
+    total_messages = await get_message_count(channel)
     return messages, total_messages[0], actually_fetched
 
-async def handle_messages(reader, interaction, channel_name, bot, rows, last_import):
+async def handle_messages(reader, interaction, channel, channel_name, bot, rows, last_import):
     global should_stop
     sent = []
     rows = []
     for row in reader:
         rows.append(row)
-    if type(interaction.channel) == discord.Thread:
-        webhook = await interaction.channel.parent.create_webhook(name='zerahook', avatar=None)
+    thread_doodad = discord.utils.MISSING
+    if type(channel) == discord.Thread:
+        webhook = await channel.parent.create_webhook(name='zerahook', avatar=None)
+        thread_doodad = channel
     else:
-        webhook = await interaction.channel.create_webhook(name=f'zerahook', avatar=None)
+        webhook = await channel.create_webhook(name=f'zerahook', avatar=None)
     timeprev = None
     timepost = None
     for rownum, row in enumerate(rows):
@@ -237,7 +287,23 @@ async def handle_messages(reader, interaction, channel_name, bot, rows, last_imp
         if rownum == 0:
             timeprev = datetime.datetime.now()
         try:
-            author_name, author_avatar_url, content, embeds, original_id, reference_id, inter_name, inter_user, reactions, attachments, stickers, components, pin_flag = row
+            author_name, author_avatar_url, content, embeds, original_id, reference_id, inter_name, inter_user, reactions, attachments, stickers, components, pin_flag, thread_flag = row
+
+            # system messages
+            if int(thread_flag) != 0:
+                if int(thread_flag) == 1:
+                    await webhook.send(embed=em.Thread.deleted_thread_sysmessage(author_name, author_avatar_url), username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
+                elif int(thread_flag) == 2:
+                    await webhook.send(embed=em.Thread.bad_thread(author_name, author_avatar_url), username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
+                else:
+                    # embed=em.Thread.thread_sysmessage(author_name)
+                    # test = await webhook.send(content="** **", username=f'{author_name} started a thread.', avatar_url=author_avatar_url, wait=True)
+                    thread = await channel.create_thread(name=content, type=discord.ChannelType.public_thread, reason='Thread import')
+                    await channel.last_message.delete()
+                    await webhook.send(embed=em.Thread.thread_sysmessage(author_name, author_avatar_url, thread.jump_url, thread.name), username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
+                if rownum == len(rows) - 1:
+                    timepost = datetime.datetime.now()
+                continue
 
             embeds2 = []
             embeds = eval(embeds)
@@ -291,17 +357,17 @@ async def handle_messages(reader, interaction, channel_name, bot, rows, last_imp
                             if i == 0:
                                 pass
                             else:
-                                await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url)
+                                await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
                         if (large_files):
                             message_text = ''
                             for large_file in large_files:
                                 message_text += large_file + '\n'
-                            await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url)
+                            await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
                         break
             # handle interaction messages
             elif inter_name != '0':
                 try:
-                    message2 = await webhook.send(content=content, embeds=embeds2, username=f'{inter_user} used {inter_name}', avatar_url=author_avatar_url, files=files[0] if files else None, view=view if view else EmptyView(), wait=True)
+                    message2 = await webhook.send(content=content, embeds=embeds2, username=f'{inter_user} used {inter_name}', avatar_url=author_avatar_url, files=files[0] if files else None, view=view if view else EmptyView(), wait=True, thread=thread_doodad)
                 except Exception as e:
                     message2 = None
                 for i, filelist in enumerate(files):
@@ -309,43 +375,48 @@ async def handle_messages(reader, interaction, channel_name, bot, rows, last_imp
                         pass
                     else:
                         if not message2:
-                            message2 = await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, wait=True)
+                            message2 = await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, wait=True, thread=thread_doodad)
                         else:
-                            await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url)
+                            await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
                 if (large_files):
                     message_text = ''
                     for large_file in large_files:
                         message_text += large_file + '\n'
                     if not message2:
-                        message = await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, wait=True)
+                        message = await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, wait=True, thread=thread_doodad)
                     else:
-                        await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url)
+                        await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
             # handle normal messages
             else:
                 try:
-                    message2 = await webhook.send(content=content, embeds=embeds2, username=author_name, avatar_url=author_avatar_url, files=files[0] if files else None, view=view if view else EmptyView(), wait=True)
+                    contents = [content[i:i+2000] for i in range(0, len(content), 2000)]
+                    message2 = await webhook.send(content=contents[0] if len(contents) > 0 else None, embeds=embeds2, username=author_name, avatar_url=author_avatar_url, files=files[0] if files else None, view=view if view else EmptyView(), wait=True, thread=thread_doodad)
+                    if len(contents) > 1:
+                        for con_slice in contents[1:]:
+                            await webhook.send(content=con_slice, username=author_name, avatar_url=author_avatar_url, wait=True, thread=thread_doodad)
                 except Exception as e:
+                    print(f'message2 error: {e}')
                     message2 = None
                 for i, filelist in enumerate(files):
                     if i == 0:
                         pass
                     else:
                         if not message2:
-                            message2 = await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, wait=True)
+                            message2 = await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, wait=True, thread=thread_doodad)
                         else:
-                            await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url)
+                            await webhook.send(files=filelist, username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
                 if (large_files):
                     message_text = ''
                     for large_file in large_files:
                         message_text += large_file + '\n'
                     if not message2:
-                        message2 = await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, wait=True)
+                        message2 = await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, wait=True, thread=thread_doodad)
                     else:
-                        await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url)
-            # send secondary messages with the reactions
+                        await webhook.send(content=message_text, username=author_name, avatar_url=author_avatar_url, thread=thread_doodad)
             sent.append((message2, original_id))
             if int(pin_flag) == 1:
                 await message2.pin()
+            # send secondary messages with the reactions
             if reactions != '[]':
                 await message2.reply(embed=em.Message.emoji_display(eval(reactions)))
             last_import = rownum
