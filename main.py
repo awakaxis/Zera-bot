@@ -45,7 +45,7 @@ class ExportToolsGroup(ap.Group):
         await interaction.response.send_message('Started fetching messages. You will receive a dm upon completion.', ephemeral=True)
         await bot.change_presence(activity=discord.CustomActivity(name='Exporting messages...'))
         start_time = datetime.datetime.now()
-        messages, total_messages, actually_fetched = await utility.fetch_messages(interaction)
+        messages, total_messages, actually_fetched = await utility.fetch_messages(interaction.channel)
         await utility.write_messages_csv(messages, f'{interaction.channel_id}.csv')
         end_time = datetime.datetime.now()
         total_time = end_time - start_time
@@ -59,7 +59,7 @@ class ExportToolsGroup(ap.Group):
         await interaction.response.send_message('Started fetching messages. You will receive a dm upon completion containing the output file. If the file is too large to be sent over discord, it will fallback to storing the file in the bot.', ephemeral=True)
         await bot.change_presence(activity=discord.CustomActivity(name='Exporting messages...'))
         start_time = datetime.datetime.now()
-        messages, total_messages, actually_fetched = await utility.fetch_messages(interaction)
+        messages, total_messages, actually_fetched = await utility.fetch_messages(interaction.channel)
         file = await utility.write_messages_csv(messages, f'{interaction.channel_id}.csv')
         end_time = datetime.datetime.now()
         total_time = end_time - start_time
