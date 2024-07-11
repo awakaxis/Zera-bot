@@ -65,17 +65,11 @@ async def get_message_count(channel: discord.TextChannel):
     logger.debug(f"Counted {message_count} messages in {time_taken.total_seconds()} seconds.")
     return message_count, time_taken.total_seconds()
 
-async def write_forum_csvs(messages, file_name: str) -> discord.File:
-    """
-    Writes forum thread atlas to a csv, and indexed forum messages to another csv.
-    :param messages: list<dict<list, int>>: list of dicts of lists of messages and the thread id for those messages.
-    """
-
 async def write_messages_csv(messages, file_name: str) -> discord.File:
     """
     Writes messages to a csv file.\n
     messages are stored in the following format:\n
-    [author's name, author's avatar url, message content, message embeds, message id, message reference id (reply id), interaction name, interaction user's name, message reactions, message attachments, message stickers, message components, boolean whether the message is pinned (0 or 1)]
+    [author's name, author's avatar url, message content, message embeds, message id, message reference id (reply id), interaction name, interaction user's name, message reactions, message attachments, message stickers, message components, boolean whether the message is pinned (0 or 1), thread flag (0, 1, 2, or thread id)]
     :param message: Messages to write to the file.
     :return: discord.File
     """
@@ -90,7 +84,7 @@ async def write_messages_csv(messages, file_name: str) -> discord.File:
                 # if the message has no thread, the flag is 1
                 # if the message has a thread but it couldnt be associated, the flag is 2
                 # if the message has a thread and it could be associated, the flag is the thread id
-                thread = associate_thread(message)
+                thread = await associate_thread(message)
                 thread_flag = 1
                 if thread:
                     thread_flag = thread.id
@@ -210,7 +204,7 @@ async def forum_tag_to_dict(forum_tag: discord.ForumTag, guild):
 def dict_to_forum_tag(dictionary: dict):
     return discord.ForumTag(emoji=dictionary['emoji'], moderated=dictionary['moderated'], name=dictionary['name'])
 
-def associate_thread(message) -> discord.Thread:
+async def associate_thread(message) -> discord.Thread:
     """
     Associates a thread with a message based on the starter message's creation date.
     :param message: Message to associate a thread with.
@@ -222,6 +216,9 @@ def associate_thread(message) -> discord.Thread:
     possible_matches = []
 
     for thread in message.channel.threads:
+        if thread.created_at == message.created_at:
+            possible_matches.append(thread)
+    async for thread in message.channel.archived_threads():
         if thread.created_at == message.created_at:
             possible_matches.append(thread)
     if (len(possible_matches) == 1):

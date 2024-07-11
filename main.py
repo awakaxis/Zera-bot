@@ -79,9 +79,10 @@ class ExportToolsGroup(ap.Group):
             writer = csv.writer(file)
             encoded_tags = [await utility.forum_tag_to_dict(tag, interaction.guild) for tag in channel.available_tags]
             writer.writerow([channel.name, encoded_tags, channel.default_reaction_emoji if type(channel.default_reaction_emoji) == str or not channel.default_reaction_emoji else await interaction.guild.fetch_emoji(channel.default_reaction_emoji.id), channel.topic])
+            total_exp_threads = 0
             total_threads = 0
             for thread in channel.threads:
-                total_threads += 1
+                total_exp_threads += 1
                 owner = await bot.fetch_user(thread.owner_id)
                 encoded_applied_tag_names = [tag.name for tag in thread.applied_tags]
                 writer.writerow([thread.id, thread.name, 1 if thread.locked else 0, owner.name if owner else 'Unknown', encoded_applied_tag_names])
@@ -89,8 +90,8 @@ class ExportToolsGroup(ap.Group):
                 total_total_messages += total_messages
                 total_total_fetched += actually_fetched
                 await utility.write_messages_csv(messages, f'{thread.id}.csv')
-            async for thread in channel.archived_threads():
-                total_threads += 1
+            async for thread in channel.archived_threads(limit=None):
+                total_exp_threads += 1
                 owner = await bot.fetch_user(thread.owner_id)
                 encoded_applied_tag_names = [tag.name for tag in thread.applied_tags]
                 writer.writerow([thread.id, thread.name, 1 if thread.locked else 0, owner.name if owner else 'Unknown', encoded_applied_tag_names])
@@ -101,7 +102,7 @@ class ExportToolsGroup(ap.Group):
 
         end_time = datetime.datetime.now()
         total_time = end_time - start_time
-        await interaction.user.send(f'Fetched and exported {total_threads} threads from `{channel.name}` ({channel.id}) in {total_time.total_seconds()} seconds.\nTotal message count: {total_total_fetched}, Total fetched: {total_total_fetched}')
+        await interaction.user.send(f'Fetched and exported {total_exp_threads} threads from `{channel.name}` ({channel.id}) in {total_time.total_seconds()} seconds.\nTotal message count: {total_total_fetched}, Total fetched: {total_total_fetched}')
         await bot.change_presence(activity=discord.CustomActivity(name='Standby'))
 
 
